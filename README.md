@@ -1,5 +1,5 @@
 > [!NOTE]
-> `🤖 vibe-coded`
+> `🤖 Built with AI`
 
 # fireplace
 
