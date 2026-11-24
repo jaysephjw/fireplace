@@ -1,3 +1,6 @@
+> [!NOTE]
+> `🤖 vibe-coded`
+
 # fireplace
 
 A small 8-bit fireplace to keep in a terminal pane: logs, flames, sparks and a
