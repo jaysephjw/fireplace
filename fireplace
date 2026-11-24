@@ -16,6 +16,9 @@ import time
 import tty
 from operator import itemgetter
 
+
+# Colours and layout ----------------------------------------------------------
+
 # One warm ramp, sampled from a real fireplace video. Everything in the scene
 # (stone, bark, flame) is an index into it, so layers combine with max().
 PALETTE = [
@@ -35,50 +38,7 @@ STAGE_ASPECT = 1.0
 PILE_ASPECT = 1.2
 
 
-def octant_chars():
-    """The character for each 2x4 pattern, bit k set for pixel k (left to
-    right, top to bottom). Unicode 16 has 230 of them in order from U+1CD00;
-    the other 26 were already block characters."""
-    older = {
-        0x00: 0x20, 0xFF: 0x2588, 0x0F: 0x2580, 0xF0: 0x2584, 0x55: 0x258C, 0xAA: 0x2590,
-        0x05: 0x2598, 0x0A: 0x259D, 0x50: 0x2596, 0xA0: 0x2597, 0xF5: 0x2599, 0x5F: 0x259B,
-        0xAF: 0x259C, 0xFA: 0x259F, 0xA5: 0x259A, 0x5A: 0x259E, 0xC0: 0x2582, 0xFC: 0x2586,
-        0x03: 0x1FB82, 0x3F: 0x1FB85, 0x01: 0x1CEA8, 0x02: 0x1CEAB, 0x40: 0x1CEA3,
-        0x80: 0x1CEA0, 0x14: 0x1FBE6, 0x28: 0x1FBE7,
-    }
-    chars, code = [], 0x1CD00
-    for mask in range(256):
-        if mask in older:
-            chars.append(chr(older[mask]))
-        else:
-            chars.append(chr(code))
-            code += 1
-    return chars
-
-
-def split(v):
-    """Two colours for a cell's pixels, and which pixels take the first. The
-    palette is one ramp, so the best pair splits the sorted values in two."""
-    order = sorted(range(8), key=v.__getitem__)
-    vals = [v[k] for k in order]
-    if vals[0] == vals[7]:
-        return 0, vals[0], vals[0]
-    total, below = sum(vals), 0
-    best = None
-    for n in range(1, 8):
-        below += vals[n - 1]
-        if vals[n] == vals[n - 1]:
-            continue
-        # Less spread around the two means is the same as a larger value here.
-        score = below * below / n + (total - below) ** 2 / (8 - n)
-        if best is None or score > best[0]:
-            best = (score, n, below)
-    _, n, below = best
-    mask = 0
-    for k in order[n:]:
-        mask |= 1 << k
-    return mask, (2 * (total - below) + 8 - n) // (2 * (8 - n)), (2 * below + n) // (2 * n)
-
+# Noise -----------------------------------------------------------------------
 
 def hash2(x, y, seed):
     n = (x * 374761393 + y * 668265263 + seed * 2147483647) & 0xFFFFFFFF
@@ -103,6 +63,25 @@ def noise(x, y, seed=0):
     return _blend(hash2(xi, yi, seed), hash2(xi + 1, yi, seed),
                   hash2(xi, yi + 1, seed), hash2(xi + 1, yi + 1, seed), fx, fy)
 
+
+def texture(w, h, cell_x, cell_y, seed):
+    """Value noise that wraps vertically, so it can scroll up forever."""
+    rows = max(1, round(h / cell_y))
+    h = int(rows * cell_y)
+    tex = [0.0] * (w * h)
+    for y in range(h):
+        yi = int(y / cell_y)
+        fy = _smooth(y / cell_y - yi)
+        y0, y1 = yi % rows, (yi + 1) % rows
+        for x in range(w):
+            xi = int(x / cell_x)
+            fx = _smooth(x / cell_x - xi)
+            tex[y * w + x] = _blend(hash2(xi, y0, seed), hash2(xi + 1, y0, seed),
+                                    hash2(xi, y1, seed), hash2(xi + 1, y1, seed), fx, fy)
+    return tex, h
+
+
+# Scene: wall, hearth and logs ------------------------------------------------
 
 class Scene:
     """The still parts: stone wall, hearth floor and logs, built for one size."""
@@ -274,22 +253,31 @@ class Scene:
                     self.rim[i] = 0.15 + 0.3 * max(0.0, -ey)
 
 
-def texture(w, h, cell_x, cell_y, seed):
-    """Value noise that wraps vertically, so it can scroll up forever."""
-    rows = max(1, round(h / cell_y))
-    h = int(rows * cell_y)
-    tex = [0.0] * (w * h)
-    for y in range(h):
-        yi = int(y / cell_y)
-        fy = _smooth(y / cell_y - yi)
-        y0, y1 = yi % rows, (yi + 1) % rows
-        for x in range(w):
-            xi = int(x / cell_x)
-            fx = _smooth(x / cell_x - xi)
-            tex[y * w + x] = _blend(hash2(xi, y0, seed), hash2(xi + 1, y0, seed),
-                                    hash2(xi, y1, seed), hash2(xi + 1, y1, seed), fx, fy)
-    return tex, h
+class FineLogs:
+    """The logs again, at the finer octant resolution of the terminal (2x4
+    per character), drawn over the fire."""
 
+    def __init__(self, w, h, seed, scale):
+        self.w = w
+        scene = Scene(w, h, seed, wall=False)
+        pixels = [i for i, _, _ in scene.bark]
+        self.pos = {i: n for n, i in enumerate(pixels)}
+        self.light = [(a, b) for _, a, b in scene.bark]
+        # Cracks glow with the fire's own crack texture, at its resolution.
+        k = 2 * scale
+        self.cracks = [(self.pos[i], i % w // k, i // w // k) for i in scene.cracks]
+
+    def values(self, fire, t):
+        glow = fire.brightness
+        out = [int(a + b * glow) for a, b in self.light]
+        for n, x, y in self.cracks:
+            v = fire.crack_light(x, y, t, glow)
+            if v > out[n]:
+                out[n] = v
+        return [v if v < TOP else TOP for v in out]
+
+
+# Fire ------------------------------------------------------------------------
 
 class Fire:
     """Flames made of noise that rises and breaks into tongues as it climbs."""
@@ -373,6 +361,8 @@ class Fire:
         self.sparks = alive
 
 
+# Clock -----------------------------------------------------------------------
+
 # A small 3x5 pixel font for the clock.
 GLYPHS = {
     "0": ["111", "101", "101", "101", "111"],
@@ -430,6 +420,8 @@ class Clock:
                             out[py * w + px] = c
 
 
+# Frames: layers combined into palette indices --------------------------------
+
 def compose(scene, fire, t, clock=None):
     """One frame as palette indices."""
     w, h = scene.w, scene.h
@@ -462,28 +454,69 @@ def compose(scene, fire, t, clock=None):
     return out
 
 
-class FineLogs:
-    """The logs again, at the finer octant resolution of the terminal (2x4
-    per character), drawn over the fire."""
+def build(term, seed, clock):
+    """The scene, fire and fine logs for the terminal's current size."""
+    mixed = term.mode == "mixed"
+    scene = Scene(term.w, term.h, seed, logs=not mixed)
+    fire = Fire(scene, seed)
+    logs = FineLogs(term.cols * 2, term.rows * 4, seed, term.scale) if mixed else None
+    term.layout(logs)
+    if clock:
+        clock.dot = term.dot
+    return scene, fire, logs
 
-    def __init__(self, w, h, seed, scale):
-        self.w = w
-        scene = Scene(w, h, seed, wall=False)
-        pixels = [i for i, _, _ in scene.bark]
-        self.pos = {i: n for n, i in enumerate(pixels)}
-        self.light = [(a, b) for _, a, b in scene.bark]
-        # Cracks glow with the fire's own crack texture, at its resolution.
-        k = 2 * scale
-        self.cracks = [(self.pos[i], i % w // k, i // w // k) for i in scene.cracks]
 
-    def values(self, fire, t):
-        glow = fire.brightness
-        out = [int(a + b * glow) for a, b in self.light]
-        for n, x, y in self.cracks:
-            v = fire.crack_light(x, y, t, glow)
-            if v > out[n]:
-                out[n] = v
-        return [v if v < TOP else TOP for v in out]
+def frame(scene, fire, logs, t, clock):
+    """Everything the terminal's cells read from: the frame, then any fine logs."""
+    out = compose(scene, fire, t, clock)
+    return out + logs.values(fire, t) if logs else out
+
+
+# Terminal: palette indices to characters -------------------------------------
+
+def octant_chars():
+    """The character for each 2x4 pattern, bit k set for pixel k (left to
+    right, top to bottom). Unicode 16 has 230 of them in order from U+1CD00;
+    the other 26 were already block characters."""
+    older = {
+        0x00: 0x20, 0xFF: 0x2588, 0x0F: 0x2580, 0xF0: 0x2584, 0x55: 0x258C, 0xAA: 0x2590,
+        0x05: 0x2598, 0x0A: 0x259D, 0x50: 0x2596, 0xA0: 0x2597, 0xF5: 0x2599, 0x5F: 0x259B,
+        0xAF: 0x259C, 0xFA: 0x259F, 0xA5: 0x259A, 0x5A: 0x259E, 0xC0: 0x2582, 0xFC: 0x2586,
+        0x03: 0x1FB82, 0x3F: 0x1FB85, 0x01: 0x1CEA8, 0x02: 0x1CEAB, 0x40: 0x1CEA3,
+        0x80: 0x1CEA0, 0x14: 0x1FBE6, 0x28: 0x1FBE7,
+    }
+    chars, code = [], 0x1CD00
+    for mask in range(256):
+        if mask in older:
+            chars.append(chr(older[mask]))
+        else:
+            chars.append(chr(code))
+            code += 1
+    return chars
+
+
+def split(v):
+    """Two colours for a cell's pixels, and which pixels take the first. The
+    palette is one ramp, so the best pair splits the sorted values in two."""
+    order = sorted(range(8), key=v.__getitem__)
+    vals = [v[k] for k in order]
+    if vals[0] == vals[7]:
+        return 0, vals[0], vals[0]
+    total, below = sum(vals), 0
+    best = None
+    for n in range(1, 8):
+        below += vals[n - 1]
+        if vals[n] == vals[n - 1]:
+            continue
+        # Less spread around the two means is the same as a larger value here.
+        score = below * below / n + (total - below) ** 2 / (8 - n)
+        if best is None or score > best[0]:
+            best = (score, n, below)
+    _, n, below = best
+    mask = 0
+    for k in order[n:]:
+        mask |= 1 << k
+    return mask, (2 * (total - below) + 8 - n) // (2 * (8 - n)), (2 * below + n) // (2 * n)
 
 
 class Terminal:
@@ -588,23 +621,7 @@ class Terminal:
         sys.stdout.flush()
 
 
-def build(term, seed, clock):
-    """The scene, fire and fine logs for the terminal's current size."""
-    mixed = term.mode == "mixed"
-    scene = Scene(term.w, term.h, seed, logs=not mixed)
-    fire = Fire(scene, seed)
-    logs = FineLogs(term.cols * 2, term.rows * 4, seed, term.scale) if mixed else None
-    term.layout(logs)
-    if clock:
-        clock.dot = term.dot
-    return scene, fire, logs
-
-
-def frame(scene, fire, logs, t, clock):
-    """Everything the terminal's cells read from: the frame, then any fine logs."""
-    out = compose(scene, fire, t, clock)
-    return out + logs.values(fire, t) if logs else out
-
+# Running ---------------------------------------------------------------------
 
 def run(fps, scale, seed, clock, cells):
     term = Terminal(scale, cells)
