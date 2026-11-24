@@ -3,6 +3,8 @@
 A small 8-bit fireplace to keep in a terminal pane: logs, flames, sparks and a
 firelit stone wall.
 
+![fireplace running with --clock](screenshot.png)
+
 ## Running it
 
 It's a single Python 3 script with no dependencies, for macOS and Linux.
