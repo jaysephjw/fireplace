@@ -37,8 +37,6 @@ If the logs look wrong, use `--cells half`.
 ./fireplace --dump 80x30 | ffmpeg -f rawvideo -pix_fmt rgb24 -s 160x120 -r 12 -i - fire.mp4
 ```
 
-[DECISIONS.md](DECISIONS.md) explains how it's drawn and why.
-
 ## Licence
 
 MIT
