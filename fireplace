@@ -1,0 +1,688 @@
+#!/usr/bin/env python3
+"""A small 8-bit fireplace for a terminal pane: logs, fire, and a stone wall.
+
+Press q, Esc or Ctrl-C to put it out.
+"""
+
+import argparse
+import math
+import os
+import random
+import select
+import signal
+import sys
+import termios
+import time
+import tty
+from operator import itemgetter
+
+# One warm ramp, sampled from a real fireplace video. Everything in the scene
+# (stone, bark, flame) is an index into it, so layers combine with max().
+PALETTE = [
+    (0x0E, 0x03, 0x02), (0x1A, 0x07, 0x03), (0x29, 0x10, 0x06), (0x3E, 0x1C, 0x0C),
+    (0x55, 0x29, 0x13), (0x6A, 0x37, 0x19), (0x7D, 0x44, 0x1F), (0x97, 0x56, 0x28),
+    (0xB7, 0x6F, 0x35), (0xD0, 0x84, 0x41), (0xE4, 0x95, 0x4B), (0xF8, 0xB0, 0x5A),
+    (0xFC, 0xCC, 0x6D), (0xFC, 0xE5, 0x84), (0xFD, 0xFC, 0xA6), (0xFD, 0xFD, 0xF2),
+]
+TOP = len(PALETTE) - 1
+
+STONE, FLOOR, BARK, END = 0, 1, 2, 3
+
+# The fire sits in a stage at the bottom of the pane. The stage is never
+# taller than it is wide, and the log pile never wider than 1.2 times the
+# stage height; past either, the pane just shows more stone.
+STAGE_ASPECT = 1.0
+PILE_ASPECT = 1.2
+
+
+def octant_chars():
+    """The character for each 2x4 pattern, bit k set for pixel k (left to
+    right, top to bottom). Unicode 16 has 230 of them in order from U+1CD00;
+    the other 26 were already block characters."""
+    older = {
+        0x00: 0x20, 0xFF: 0x2588, 0x0F: 0x2580, 0xF0: 0x2584, 0x55: 0x258C, 0xAA: 0x2590,
+        0x05: 0x2598, 0x0A: 0x259D, 0x50: 0x2596, 0xA0: 0x2597, 0xF5: 0x2599, 0x5F: 0x259B,
+        0xAF: 0x259C, 0xFA: 0x259F, 0xA5: 0x259A, 0x5A: 0x259E, 0xC0: 0x2582, 0xFC: 0x2586,
+        0x03: 0x1FB82, 0x3F: 0x1FB85, 0x01: 0x1CEA8, 0x02: 0x1CEAB, 0x40: 0x1CEA3,
+        0x80: 0x1CEA0, 0x14: 0x1FBE6, 0x28: 0x1FBE7,
+    }
+    chars, code = [], 0x1CD00
+    for mask in range(256):
+        if mask in older:
+            chars.append(chr(older[mask]))
+        else:
+            chars.append(chr(code))
+            code += 1
+    return chars
+
+
+def split(v):
+    """Two colours for a cell's pixels, and which pixels take the first. The
+    palette is one ramp, so the best pair splits the sorted values in two."""
+    order = sorted(range(8), key=v.__getitem__)
+    vals = [v[k] for k in order]
+    if vals[0] == vals[7]:
+        return 0, vals[0], vals[0]
+    total, below = sum(vals), 0
+    best = None
+    for n in range(1, 8):
+        below += vals[n - 1]
+        if vals[n] == vals[n - 1]:
+            continue
+        # Less spread around the two means is the same as a larger value here.
+        score = below * below / n + (total - below) ** 2 / (8 - n)
+        if best is None or score > best[0]:
+            best = (score, n, below)
+    _, n, below = best
+    mask = 0
+    for k in order[n:]:
+        mask |= 1 << k
+    return mask, (2 * (total - below) + 8 - n) // (2 * (8 - n)), (2 * below + n) // (2 * n)
+
+
+def hash2(x, y, seed):
+    n = (x * 374761393 + y * 668265263 + seed * 2147483647) & 0xFFFFFFFF
+    n = ((n ^ (n >> 13)) * 1274126177) & 0xFFFFFFFF
+    return ((n ^ (n >> 16)) & 0xFFFF) / 65535.0
+
+
+def _smooth(f):
+    return f * f * (3 - 2 * f)
+
+
+def _blend(a, b, c, d, fx, fy):
+    """Bilinear blend of four corners: a and b on top, c and d below."""
+    top = a + (b - a) * fx
+    return top + (c + (d - c) * fx - top) * fy
+
+
+def noise(x, y, seed=0):
+    """Smooth value noise in 0..1."""
+    xi, yi = math.floor(x), math.floor(y)
+    fx, fy = _smooth(x - xi), _smooth(y - yi)
+    return _blend(hash2(xi, yi, seed), hash2(xi + 1, yi, seed),
+                  hash2(xi, yi + 1, seed), hash2(xi + 1, yi + 1, seed), fx, fy)
+
+
+class Scene:
+    """The still parts: stone wall, hearth floor and logs, built for one size."""
+
+    def __init__(self, w, h, seed, wall=True, logs=True):
+        """Without the wall there are only logs; without logs, only where
+        they'd burn, so another layer can draw them."""
+        self.w, self.h = w, h
+        self.paint_logs = logs
+        rng = random.Random(seed)
+        n = w * h
+        self.kind = [STONE] * n
+        self.base = [0.0] * n   # 0..1 brightness before firelight
+        self.light = [0.0] * n  # how much firelight reaches this pixel
+        self.rim = [0.0] * n    # log edges facing the flames
+        self.crack = [False] * n
+        self.stage_h = min(h, w / STAGE_ASPECT)
+        self.stage_top = h - self.stage_h
+        self.fire_base = int(self.sy(0.86))
+        self.pile_width = min(w, self.stage_h * PILE_ASPECT)
+        self.pile_left = (w - self.pile_width) / 2
+        if wall:
+            self._wall(rng)
+            self._floor()
+        self._logs(rng)
+        self._prepare()
+
+    def _prepare(self):
+        """Split pixels by kind, with the lighting math folded into two
+        factors each, so a frame is a few flat loops."""
+        base, light, rim = self.base, self.light, self.rim
+        self.stone, self.floor, self.bark, self.cracks = [], [], [], []
+        for i, k in enumerate(self.kind):
+            if k == STONE:
+                self.stone.append((i, base[i] * 1.2, base[i] * 6.8 * light[i]))
+            elif k == FLOOR:
+                self.floor.append((i, i % self.w, i // self.w, base[i] * 1.5, base[i] * 10.5 * light[i]))
+            else:
+                self.bark.append((i, base[i] * 3.0, rim[i] * 8.0))
+                if self.crack[i]:
+                    self.cracks.append(i)
+        # Flames only reach this box, so only its wall and floor need them.
+        x0 = max(0, int(self.fire_left) - 3)
+        x1 = min(self.w, int(self.fire_right) + 3)
+        self.fire_box = (x0, x1)
+        self.behind = [y * self.w + x for y in range(self.fire_base + 1) for x in range(x0, x1)
+                       if self.kind[y * self.w + x] in (STONE, FLOOR)]
+
+    def sy(self, f):
+        """A height in the stage, as a fraction from its top, in pixels."""
+        return self.stage_top + f * self.stage_h
+
+    def _wall(self, rng):
+        w, h = self.w, self.h
+        cell = max(6.0, self.stage_h / 5.0)
+        cols, rows = int(w / cell) + 3, int(h / (cell * 0.75)) + 3
+        seeds = {}
+        for gy in range(-1, rows):
+            for gx in range(-1, cols):
+                sx = (gx + rng.random()) * cell
+                sy = (gy + rng.random()) * cell * 0.75
+                seeds[gx, gy] = (sx, sy, 0.45 + rng.random() * 0.55)
+        cx, cy = self.pile_left + self.pile_width * 0.5, self.sy(0.78)
+        for y in range(h):
+            gy = int(y / (cell * 0.75))
+            for x in range(w):
+                gx = int(x / cell)
+                best = second = 1e9
+                pick = None
+                for oy in (-1, 0, 1):
+                    for ox in (-1, 0, 1):
+                        s = seeds.get((gx + ox, gy + oy))
+                        if s is None:
+                            continue
+                        dx, dy = (x - s[0]) / 1.25, (y - s[1])
+                        d = math.sqrt(dx * dx + dy * dy)
+                        if d < best:
+                            best, second, pick = d, best, (s, dx, dy)
+                        elif d < second:
+                            second = d
+                i = y * w + x
+                if second - best < 1.1:
+                    b = 0.12
+                else:
+                    s, dx, dy = pick
+                    r = best / (cell * 0.6)
+                    b = s[2] * (1.0 - 0.45 * r * r) - 0.12 * (dx + dy) / cell
+                    b += (hash2(x, y, 7) - 0.5) * 0.12
+                self.base[i] = max(0.05, min(1.0, b))
+                fx, fy = (x - cx) / (self.pile_width * 0.75), (y - cy) / (self.stage_h * 0.75)
+                self.light[i] = math.exp(-(fx * fx + fy * fy))
+
+    def _floor(self):
+        w, h = self.w, self.h
+        top = int(self.sy(0.9))
+        for y in range(top, h):
+            for x in range(w):
+                i = y * w + x
+                self.kind[i] = FLOOR
+                self.base[i] = 0.3 + 0.4 * noise(x * 0.35, y * 0.7, 3) + 0.15 * hash2(x, y, 3)
+
+    def _logs(self, rng):
+        w = self.w
+        # (x0, y0, x1, y1, radius) in fractions of the pile's width and the height.
+        logs = [
+            (0.00, 0.80, 0.40, 0.71, 0.07),
+            (0.46, 0.84, 1.03, 0.76, 0.075),
+            (0.63, 0.86, 0.57, 0.69, 0.08),
+            (0.18, 0.95, 0.64, 0.84, 0.085),
+        ]
+        left, pw = self.pile_left, self.pile_width
+
+        def px(f):
+            return left + f * pw
+
+        for n, (x0, y0, x1, y1, r) in enumerate(logs if self.paint_logs else ()):
+            r *= self.stage_h
+            self._log(px(x0), self.sy(y0), px(x1), self.sy(y1), r, n)
+            if n == 2:
+                self._end(px(x1), self.sy(y1) - r * 0.2, r)
+
+        self.fire_left, self.fire_right = int(px(0.03)), int(px(0.97))
+        self.fire_span = span = max(1, self.fire_right - self.fire_left)
+        self.fuel = [0.0] * w
+        for x in range(self.fire_left, self.fire_right):
+            self.fuel[x] = math.sin(math.pi * (x - self.fire_left) / span) ** 0.5
+
+    def _log(self, x0, y0, x1, y1, r, n):
+        w, h = self.w, self.h
+        ax, ay = x1 - x0, y1 - y0
+        length = math.hypot(ax, ay)
+        ux, uy = ax / length, ay / length
+        # Normal pointing up the screen, so v < 0 is the side facing the fire.
+        nx, ny = (uy, -ux) if -ux < 0 else (-uy, ux)
+        for y in range(max(0, int(min(y0, y1) - r) - 1), min(h, int(max(y0, y1) + r) + 2)):
+            for x in range(max(0, int(min(x0, x1) - r) - 1), min(w, int(max(x0, x1) + r) + 2)):
+                px, py = x + 0.5 - x0, y + 0.5 - y0
+                t = max(0.0, min(length, px * ux + py * uy))
+                dx, dy = px - t * ux, py - t * uy
+                if dx * dx + dy * dy > r * r:
+                    continue
+                v = -(dx * nx + dy * ny) / r
+                i = y * w + x
+                self.kind[i] = BARK
+                grain = noise(t * 0.35, v * 2.5, 11 + n)
+                self.base[i] = max(0.0, 0.22 - 0.12 * v + 0.5 * (grain - 0.5))
+                self.rim[i] = max(0.0, (-v - 0.45) / 0.55) ** 1.5
+                self.crack[i] = abs(v) < 0.8 and hash2(int(t / 3.5), int((v + 1) * 4), 21 + n) < 0.08
+                self.light[i] = 1.0
+
+    def _end(self, cx, cy, r):
+        """The cut end of a log, facing us."""
+        w, h = self.w, self.h
+        rx, ry = r * 1.05, r * 0.9
+        for y in range(max(0, int(cy - ry) - 1), min(h, int(cy + ry) + 2)):
+            for x in range(max(0, int(cx - rx) - 1), min(w, int(cx + rx) + 2)):
+                ex, ey = (x + 0.5 - cx) / rx, (y + 0.5 - cy) / ry
+                d = math.sqrt(ex * ex + ey * ey)
+                if d > 1.0:
+                    continue
+                i = y * w + x
+                self.kind[i] = END
+                self.crack[i] = False
+                if d > 0.82:
+                    self.base[i], self.rim[i] = 0.25, max(0.0, -ey)
+                else:
+                    ring = int(d * 4.5 + hash2(x, y, 5) * 0.25) % 2
+                    self.base[i] = 0.9 + 1.0 * ring - 0.3 * (ex + ey)
+                    self.rim[i] = 0.15 + 0.3 * max(0.0, -ey)
+
+
+def texture(w, h, cell_x, cell_y, seed):
+    """Value noise that wraps vertically, so it can scroll up forever."""
+    rows = max(1, round(h / cell_y))
+    h = int(rows * cell_y)
+    tex = [0.0] * (w * h)
+    for y in range(h):
+        yi = int(y / cell_y)
+        fy = _smooth(y / cell_y - yi)
+        y0, y1 = yi % rows, (yi + 1) % rows
+        for x in range(w):
+            xi = int(x / cell_x)
+            fx = _smooth(x / cell_x - xi)
+            tex[y * w + x] = _blend(hash2(xi, y0, seed), hash2(xi + 1, y0, seed),
+                                    hash2(xi, y1, seed), hash2(xi + 1, y1, seed), fx, fy)
+    return tex, h
+
+
+class Fire:
+    """Flames made of noise that rises and breaks into tongues as it climbs."""
+
+    def __init__(self, scene, seed):
+        self.s = scene
+        w, h = self.w, self.h = scene.w, scene.h
+        self.heat = [0] * (w * h)
+        self.rng = random.Random(seed)
+        sh = scene.stage_h
+        pw = scene.pile_width
+        self.big, self.big_h = texture(w, int(sh * 2), max(3.0, pw / 13), max(4.0, sh / 4.5), seed + 1)
+        self.small, self.small_h = texture(w, int(sh * 2), max(2.0, pw / 30), max(2.5, sh / 11), seed + 2)
+        # Rows of these are moments in time, read in turn: how hard each
+        # column burns, the shimmer on the hearth floor, and the cracks.
+        self.fuel_tex, self.fuel_h = texture(w, 256, 14.0, 8.0, seed + 3)
+        self.floor_tex, self.floor_h = texture(w, 64, 2.9, 2.0, seed + 4)
+        self.crack_tex, self.crack_h = texture(w, 96, 2.5, 6.0, seed + 5)
+        self.reach = scene.fire_base - scene.sy(0.02)
+        # Flame strength (in 64ths) to palette index, with room above 64 so
+        # strong flame needs no clamping. Cool flame stays dim so the wall
+        # shows through.
+        self.color = [min(TOP, int(min(1.0, n / 64) ** 0.9 * (TOP + 0.99))) for n in range(200)]
+        self.glow = 0.7
+        self.sparks = []
+
+    def step(self, t, dt):
+        w, s, heat = self.w, self.s, self.heat
+        base, reach = s.fire_base, self.reach
+
+        row = (int(t * 7.2) % self.fuel_h) * w
+        tex = self.fuel_tex
+        fuel = [e * (0.6 + 0.7 * tex[row + x]) if e else 0.0 for x, e in enumerate(s.fuel)]
+        self.glow += (sum(fuel) / s.fire_span - self.glow) * 0.3
+
+        big, small, color = self.big, self.small, self.color
+        big_h, small_h = self.big_h, self.small_h
+        rise_big, rise_small = int(t * s.stage_h * 0.55), int(t * s.stage_h * 0.95)
+        top = max(0, int(base - reach))
+        x0, x1 = s.fire_box
+        for y in range(top, base + 1):
+            up = min(1.0, (base - y) / reach)
+            body, bite = 1.65 * (1 - up) ** 0.8, 1.9 * up + 0.12
+            sway = int(round(1.4 * up * math.sin(y * 0.18 + t * 2.1)))
+            rb = ((y + rise_big) % big_h) * w
+            rs = ((y + rise_small) % small_h) * w
+            row = y * w
+            for x in range(x0, x1):
+                k = x + sway
+                if k < 0 or k >= w:
+                    heat[row + x] = 0
+                    continue
+                f = fuel[k] * body - (1.0 - big[rb + k] * 0.65 - small[rs + k] * 0.35) * bite
+                heat[row + x] = color[int(f * 64)] if f > 0 else 0
+
+        self._sparks(t, dt)
+
+    @property
+    def brightness(self):
+        """How strongly the fire lights the room, for the still layers."""
+        return 0.55 + 0.6 * self.glow
+
+    def crack_light(self, x, y, t, glow):
+        """The palette value of a glowing crack at (x, y), unclamped."""
+        c = self.crack_tex[((int(t * 7.8) + y) % self.crack_h) * self.w + x]
+        return int(c * c * 13 * glow)
+
+    def _sparks(self, t, dt):
+        s, rng = self.s, self.rng
+        if rng.random() < dt * 3.0 * self.glow:
+            x = s.fire_left + rng.random() * (s.fire_right - s.fire_left)
+            self.sparks.append([x, s.sy(0.62), (rng.random() - 0.5) * 4, -(8 + rng.random() * 14) * s.stage_h / 60,
+                                0.8 + rng.random() * 1.6])
+        alive = []
+        for p in self.sparks:
+            p[0] += (p[2] + (noise(p[1] * 0.2, t, 9) - 0.5) * 10) * dt
+            p[1] += p[3] * dt
+            p[4] -= dt
+            if p[4] > 0 and p[1] > 0:
+                alive.append(p)
+        self.sparks = alive
+
+
+# A small 3x5 pixel font for the clock.
+GLYPHS = {
+    "0": ["111", "101", "101", "101", "111"],
+    "1": ["010", "110", "010", "010", "111"],
+    "2": ["111", "001", "111", "100", "111"],
+    "3": ["111", "001", "011", "001", "111"],
+    "4": ["101", "101", "111", "001", "001"],
+    "5": ["111", "100", "111", "001", "111"],
+    "6": ["111", "100", "111", "101", "111"],
+    "7": ["111", "001", "010", "010", "010"],
+    "8": ["111", "101", "111", "101", "111"],
+    "9": ["111", "101", "111", "001", "111"],
+    ":": ["0", "1", "0", "1", "0"],
+}
+
+
+def clock_pixels(now):
+    """The time as a set of lit (x, y) pixels, and its width."""
+    pixels, x = set(), 0
+    hour = now.tm_hour % 12 or 12
+    for c in "%d:%02d" % (hour, now.tm_min):
+        rows = GLYPHS[c]
+        for y, row in enumerate(rows):
+            for i, bit in enumerate(row):
+                if bit == "1":
+                    pixels.add((x + i, y))
+        x += len(rows[0]) + 1
+    return pixels, x - 1
+
+
+CLOCK_COLOR = 10
+
+
+class Clock:
+    def __init__(self):
+        self.minute = None
+        self.dot = 1  # fire pixels per clock pixel
+
+    def draw(self, out, scene):
+        w, h = scene.w, scene.h
+        now = time.localtime()
+        if now.tm_min != self.minute:
+            self.minute = now.tm_min
+            self.pixels, self.width = clock_pixels(now)
+        d = self.dot
+        left = w - (self.width + 3) * d
+        top = int(scene.stage_top) + max(d, int(scene.stage_h) // 14)
+        for x, y in self.pixels:
+            for dx, dy, c in ((1, 1, 0), (0, 0, CLOCK_COLOR)):
+                if not c and (x + 1, y + 1) in self.pixels:
+                    continue
+                for py in range(top + (y + dy) * d, top + (y + dy + 1) * d):
+                    for px in range(left + (x + dx) * d, left + (x + dx + 1) * d):
+                        if 0 <= px < w and 0 <= py < h:
+                            out[py * w + px] = c
+
+
+def compose(scene, fire, t, clock=None):
+    """One frame as palette indices."""
+    w, h = scene.w, scene.h
+    heat = fire.heat
+    glow = fire.brightness
+    out = [0] * (w * h)
+    for i, a, b in scene.stone:
+        out[i] = int(a + b * glow)
+    tex, floor_h, drift = fire.floor_tex, fire.floor_h, int(t * 1.2)
+    for i, x, y, a, b in scene.floor:
+        e = tex[((drift + y) % floor_h) * w + x] * glow
+        out[i] = int(a + b * e * e)
+    for i in scene.behind:
+        f = heat[i]
+        if f > out[i]:
+            out[i] = f
+    for i, a, b in scene.bark:
+        v = int(a + b * glow)
+        out[i] = v if v < TOP else TOP
+    for i in scene.cracks:
+        v = fire.crack_light(i % w, i // w, t, glow)
+        if v > out[i]:
+            out[i] = v if v < TOP else TOP
+    for x, y, _, _, life in fire.sparks:
+        xi, yi = int(x), int(y)
+        if 0 <= xi < w and 0 <= yi < h:
+            out[yi * w + xi] = max(out[yi * w + xi], min(TOP, 9 + int(life * 4)))
+    if clock:
+        clock.draw(out, scene)
+    return out
+
+
+class FineLogs:
+    """The logs again, at the finer octant resolution of the terminal (2x4
+    per character), drawn over the fire."""
+
+    def __init__(self, w, h, seed, scale):
+        self.w = w
+        scene = Scene(w, h, seed, wall=False)
+        pixels = [i for i, _, _ in scene.bark]
+        self.pos = {i: n for n, i in enumerate(pixels)}
+        self.light = [(a, b) for _, a, b in scene.bark]
+        # Cracks glow with the fire's own crack texture, at its resolution.
+        k = 2 * scale
+        self.cracks = [(self.pos[i], i % w // k, i // w // k) for i in scene.cracks]
+
+    def values(self, fire, t):
+        glow = fire.brightness
+        out = [int(a + b * glow) for a, b in self.light]
+        for n, x, y in self.cracks:
+            v = fire.crack_light(x, y, t, glow)
+            if v > out[n]:
+                out[n] = v
+        return [v if v < TOP else TOP for v in out]
+
+
+class Terminal:
+    def __init__(self, scale, cells="mixed", size=None):
+        self.fixed_scale = scale
+        self.mode = cells
+        # Fire pixels across and down in one character cell.
+        self.sub = (2, 4) if cells == "octant" else (1, 2)
+        self.chars = octant_chars()
+        self.split = {}
+        rgb = ["2;%d;%d;%d" % c for c in PALETTE]
+        self.fg = ["\x1b[38;%sm" % c for c in rgb]
+        self.bg = ["\x1b[48;%sm" % c for c in rgb]
+        self.both = [["\x1b[38;%s;48;%sm" % (f, b) for b in rgb] for f in rgb]
+        self.resize(size)
+
+    def resize(self, size=None):
+        size = size or os.get_terminal_size()
+        self.cols, self.rows = size[0], max(1, size[1])
+        sx, sy = self.sub
+        px_w, px_h = self.cols * sx, self.rows * sy
+        stage = min(px_h, px_w / STAGE_ASPECT)
+        self.scale = self.fixed_scale or max(1, round(stage / (30 * sy)))
+        self.w = -(-px_w // self.scale)
+        self.h = -(-px_h // self.scale)
+        self.dot = max(1, round(sy / 2 / self.scale))
+        self.prev = None
+
+    def layout(self, logs=None):
+        """Which pixels make up each cell: two of the frame for a half block,
+        or eight for octants. Fine log pixels come after the frame."""
+        s, w, cols = self.scale, self.w, self.cols
+        n = w * self.h
+        octant = self.sub == (2, 4)
+        self.getters = []
+        for row in range(self.rows):
+            for col in range(cols):
+                ix = None
+                if octant:
+                    ix = [((4 * row + k // 2) // s) * w + (2 * col + k % 2) // s for k in range(8)]
+                elif logs:
+                    fine = [logs.pos.get((4 * row + k // 2) * 2 * cols + 2 * col + k % 2) for k in range(8)]
+                    if any(f is not None for f in fine):
+                        ix = [n + f if f is not None else
+                              ((4 * row + k // 2) // (2 * s)) * w + (2 * col + k % 2) // (2 * s)
+                              for k, f in enumerate(fine)]
+                if ix is None:
+                    ix = [((2 * row) // s) * w + col // s, ((2 * row + 1) // s) * w + col // s]
+                self.getters.append(itemgetter(*ix))
+
+    def cell(self, v):
+        """A cell's pattern, as (mask, colour of set pixels, colour of the rest)."""
+        if len(v) == 2:
+            return (0x0F, v[0], v[1]) if v[0] != v[1] else (0, v[0], v[0])
+        q = self.split.get(v)
+        if q is None:
+            if len(self.split) > 50000:
+                self.split.clear()
+            q = self.split[v] = split(v)
+        return q
+
+    def draw(self, src):
+        cols = self.cols
+        prev = self.prev or [None] * (cols * self.rows)
+        fg, bg, both, chars, cell = self.fg, self.bg, self.both, self.chars, self.cell
+        parts = ["\x1b[?2026h"]
+        cur_fg = cur_bg = at = None
+        for n, get in enumerate(self.getters):
+            v = get(src)
+            if prev[n] == v:
+                continue
+            prev[n] = v
+            if at != n:
+                parts.append("\x1b[%d;%dH" % (n // cols + 1, n % cols + 1))
+            mask, top, bot = cell(v)
+            if mask == 0 or top == bot:
+                # A solid cell can be drawn with whichever colour is set.
+                if bot == cur_bg:
+                    parts.append(" ")
+                else:
+                    if bot != cur_fg:
+                        parts.append(fg[bot])
+                        cur_fg = bot
+                    parts.append("\u2588")
+            else:
+                # Flip the pattern if that saves a colour change.
+                if (top != cur_fg) + (bot != cur_bg) > (bot != cur_fg) + (top != cur_bg):
+                    mask, top, bot = mask ^ 255, bot, top
+                if top != cur_fg and bot != cur_bg:
+                    parts.append(both[top][bot])
+                elif top != cur_fg:
+                    parts.append(fg[top])
+                elif bot != cur_bg:
+                    parts.append(bg[bot])
+                cur_fg, cur_bg = top, bot
+                parts.append(chars[mask])
+            # Move explicitly at the start of each row rather than wrap.
+            at = n + 1 if (n + 1) % cols else None
+        parts.append("\x1b[0m\x1b[?2026l")
+        self.prev = prev
+        sys.stdout.write("".join(parts))
+        sys.stdout.flush()
+
+
+def build(term, seed, clock):
+    """The scene, fire and fine logs for the terminal's current size."""
+    mixed = term.mode == "mixed"
+    scene = Scene(term.w, term.h, seed, logs=not mixed)
+    fire = Fire(scene, seed)
+    logs = FineLogs(term.cols * 2, term.rows * 4, seed, term.scale) if mixed else None
+    term.layout(logs)
+    if clock:
+        clock.dot = term.dot
+    return scene, fire, logs
+
+
+def frame(scene, fire, logs, t, clock):
+    """Everything the terminal's cells read from: the frame, then any fine logs."""
+    out = compose(scene, fire, t, clock)
+    return out + logs.values(fire, t) if logs else out
+
+
+def run(fps, scale, seed, clock, cells):
+    term = Terminal(scale, cells)
+    resized = [False]
+    signal.signal(signal.SIGWINCH, lambda *_: resized.__setitem__(0, True))
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
+    try:
+        tty.setcbreak(fd)
+        scene, fire, logs = build(term, seed, clock)
+        start = last = time.monotonic()
+        while True:
+            if resized[0]:
+                resized[0] = False
+                term.resize()
+                sys.stdout.write("\x1b[2J")
+                scene, fire, logs = build(term, seed, clock)
+            now = time.monotonic()
+            t, dt = now - start, now - last
+            last = now
+            fire.step(t, dt)
+            term.draw(frame(scene, fire, logs, t, clock))
+            wait = max(0.0, 1 / fps - (time.monotonic() - now))
+            ready, _, _ = select.select([sys.stdin], [], [], wait)
+            if ready and os.read(fd, 32)[:1] in (b"q", b"Q", b"\x1b"):
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+
+
+def dump(size, frames, fps, seed, clock, cells):
+    """Write raw RGB frames to stdout as the terminal would show them, at 2x4
+    pixels per character, for previewing with ffmpeg. The size is in
+    characters."""
+    cols, rows = (int(n) for n in size.lower().split("x"))
+    term = Terminal(0, cells, (cols, rows))
+    scene, fire, logs = build(term, seed, clock)
+    rgb = [bytes(c) for c in PALETTE]
+    w = cols * 2
+    out = sys.stdout.buffer
+    for n in range(frames):
+        t = n / fps
+        fire.step(t, 1 / fps)
+        src = frame(scene, fire, logs, t, clock)
+        image = [0] * (w * rows * 4)
+        for c, get in enumerate(term.getters):
+            mask, top, bot = term.cell(get(src))
+            x, y = c % cols * 2, c // cols * 4
+            for k in range(8):
+                image[(y + k // 2) * w + x + k % 2] = top if mask >> k & 1 else bot
+        out.write(b"".join(rgb[i] for i in image))
+    out.flush()
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--fps", type=float, default=12, help="frames per second (default 12)")
+    p.add_argument("--scale", type=int, default=0, help="screen pixels per fire pixel (default: fit the pane)")
+    p.add_argument("--clock", action="store_true", help="show the time above the fire")
+    p.add_argument("--seed", type=int, default=None, help="lay out the same stones and logs every time")
+    p.add_argument("--dump", metavar="COLSxROWS", help="write raw RGB frames to stdout instead of drawing")
+    p.add_argument("--frames", type=int, default=120, help="frames to write with --dump")
+    p.add_argument("--cells", choices=("mixed", "half", "octant"), default="mixed",
+                   help="pixels per character: half (1x2), octant (2x4), or mixed, half with octant logs "
+                        "(default). Octants need a Unicode 16 terminal")
+    a = p.parse_args()
+    seed = a.seed if a.seed is not None else random.randrange(1 << 30)
+    clock = Clock() if a.clock else None
+    if a.dump:
+        dump(a.dump, a.frames, a.fps, seed, clock, a.cells)
+    else:
+        run(a.fps, a.scale, seed, clock, a.cells)
+
+
+if __name__ == "__main__":
+    main()
