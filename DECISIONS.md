@@ -3,7 +3,7 @@
 ## 2026-11-24 — One Python script, no dependencies
 
 It runs on the system `python3` with only the standard library, so the
-module is a single symlinked file with no build step or toolchain. At this
+whole thing is a single file with no build step or toolchain. At this
 resolution (roughly 80×60 pixels, 12 fps) Python is fast enough. Pixels are
 drawn as `▀` half blocks in 24-bit colour, and only changed cells are
 redrawn each frame.
